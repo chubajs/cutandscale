@@ -1,5 +1,5 @@
 import sys
-from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QPushButton, QFileDialog, QLabel, QMessageBox, QHBoxLayout, QProgressBar, QTextEdit
+from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QPushButton, QFileDialog, QLabel, QMessageBox, QHBoxLayout, QProgressBar, QTextEdit, QComboBox
 from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage
 from PyQt5.QtCore import Qt, QRect, QPoint, QThread, pyqtSignal, QUrl
 from PIL import Image
@@ -130,59 +130,64 @@ class UpscaleWorker(QThread):
     error = pyqtSignal(str)
     log = pyqtSignal(str)
 
-    def __init__(self, image_paths, save_path):
+    def __init__(self, image_paths, save_path, model):
         super().__init__()
         self.image_paths = image_paths
         self.save_path = save_path
+        self.model = model
         self.is_running = True
 
     def run(self):
-        async def upscale_image(img_path, index):
+        for i, img_path in enumerate(self.image_paths):
             if not self.is_running:
-                return
+                break
+            self.progress.emit(i, "", "Starting")
             try:
-                self.log.emit(f"Image {index + 1}: Uploading")
+                self.log.emit(f"Image {i + 1}: Uploading")
                 
                 # Upload the image file
                 image_url = fal_client.upload_file(img_path)
 
-                self.log.emit(f"Image {index + 1}: Processing")
-                response = await fal_client.submit_async("fal-ai/aura-sr", arguments={
-                    "image_url": image_url,
-                    "upscaling_factor": 4,
-                    "checkpoint": "v2"
-                })
+                self.log.emit(f"Image {i + 1}: Processing")
+                if self.model == "fal-ai/aura-sr":
+                    response = fal_client.run(self.model, arguments={
+                        "image_url": image_url,
+                        "upscaling_factor": 4,
+                        "checkpoint": "v2"
+                    })
+                elif self.model == "fal-ai/creative-upscaler":
+                    response = fal_client.run(self.model, arguments={
+                        "image_url": image_url,
+                        "scale": 2,
+                        "creativity": 0.1,
+                        "detail": 1,
+                        "shape_preservation": 0.25,
+                        "prompt_suffix": " high quality, highly detailed, high resolution, sharp",
+                        "negative_prompt": "blurry, low resolution, bad, ugly, low quality, pixelated, interpolated, compression artifacts, noisey, grainy",
+                        "guidance_scale": 7.5,
+                        "num_inference_steps": 20,
+                        "enable_safety_checks": True,
+                        "additional_lora_scale": 1
+                    })
 
-                result = await response.get()
-                upscaled_img_url = result["image"]["url"]
-                upscaled_img_path = f"{self.save_path}/upscaled_image_{index+1}.jpg"
+                upscaled_img_url = response["image"]["url"]
+                upscaled_img_path = f"{self.save_path}/upscaled_image_{i+1}.jpg"
                 
-                self.log.emit(f"Image {index + 1}: Downloading")
+                self.log.emit(f"Image {i + 1}: Downloading")
                 response = requests.get(upscaled_img_url)
                 if response.status_code == 200:
                     with open(upscaled_img_path, 'wb') as f:
                         f.write(response.content)
-                    self.log.emit(f"Image {index + 1}: Saved")
+                    self.log.emit(f"Image {i + 1}: Saved")
                 else:
                     raise Exception(f"Download failed. Status code: {response.status_code}")
 
-                self.progress.emit(index, upscaled_img_path, "Completed")
+                self.progress.emit(i, upscaled_img_path, "Completed")
             except Exception as e:
-                self.log.emit(f"Image {index + 1}: Error - {str(e)}")
+                self.log.emit(f"Image {i + 1}: Error - {str(e)}")
                 self.error.emit(str(e))
-                return False
-            return True
+                break
 
-        async def upscale_all():
-            for i, img_path in enumerate(self.image_paths):
-                if not self.is_running:
-                    break
-                self.progress.emit(i, "", "Starting")
-                success = await upscale_image(img_path, i)
-                if not success:
-                    break
-
-        asyncio.run(upscale_all())
         if self.is_running:
             self.finished.emit()
 
@@ -193,6 +198,10 @@ class UpscaleWorker(QThread):
 class ImageSplitter(QWidget):
     def __init__(self):
         super().__init__()
+        self.models = {
+            "Aura SR": "fal-ai/aura-sr",
+            "Creative Upscaler": "fal-ai/creative-upscaler"
+        }
         self.initUI()
         self.original_image = None
         self.display_image = None
@@ -257,6 +266,11 @@ class ImageSplitter(QWidget):
         self.log_text_edit.setFixedHeight(100)  # Set a fixed height of 100 pixels
         layout.addWidget(self.log_text_edit)
 
+        # Add model selector
+        self.model_selector = QComboBox()
+        self.model_selector.addItems(self.models.keys())
+        button_layout.addWidget(self.model_selector)
+
         layout.addLayout(button_layout)
 
         self.setLayout(layout)
@@ -284,6 +298,7 @@ class ImageSplitter(QWidget):
             self.update_display()
             self.cut_button.setEnabled(True)
             self.split_button.setEnabled(True)
+            self.upscale_button.setEnabled(True)  # Always enable upscale button
             self.is_cut = False
         except Exception as e:
             print(f"Error loading image: {e}")
@@ -372,7 +387,7 @@ class ImageSplitter(QWidget):
         self.is_cut = True
         self.undo_button.setEnabled(True)
         self.cut_button.setEnabled(False)
-        self.upscale_button.setEnabled(True)
+        self.upscale_button.setEnabled(True)  # Always enable upscale button
         self.update_display()
 
     def undo_cut(self):
@@ -380,7 +395,7 @@ class ImageSplitter(QWidget):
         self.cut_images = None
         self.undo_button.setEnabled(False)
         self.cut_button.setEnabled(True)
-        self.upscale_button.setEnabled(False)
+        self.upscale_button.setEnabled(True)  # Always enable upscale button
         self.update_display()
 
     def split_image(self):
@@ -430,7 +445,12 @@ class ImageSplitter(QWidget):
             print("Image splitting cancelled.")
 
     def upscale_images(self):
-        if not self.is_cut or not self.cut_images:
+        if not self.original_image:
+            QMessageBox.warning(self, "Error", "No image loaded. Please select an image first.")
+            return
+
+        if self.upscale_worker and self.upscale_worker.isRunning():
+            QMessageBox.warning(self, "Warning", "An upscale process is already running. Please wait for it to finish or stop it.")
             return
 
         save_path = QFileDialog.getExistingDirectory(self, "Select Directory to Save Upscaled Images", self.last_folder)
@@ -439,22 +459,35 @@ class ImageSplitter(QWidget):
 
         self.last_folder = save_path
         
-        # Create a temporary directory to store cut images
-        self.temp_dir = tempfile.TemporaryDirectory()
-        temp_image_paths = []
-        for i, row in enumerate(self.cut_images):
-            for j, img in enumerate(row):
-                temp_path = os.path.join(self.temp_dir.name, f"temp_image_{i}_{j}.png")
-                img.save(temp_path, format="PNG")
-                temp_image_paths.append(temp_path)
-        
-        self.upscale_worker = UpscaleWorker(temp_image_paths, save_path)
+        selected_model = self.models[self.model_selector.currentText()]
+
+        if self.is_cut and self.cut_images:
+            # Upscale cut images
+            self.temp_dir = tempfile.TemporaryDirectory()
+            temp_image_paths = []
+            for i, row in enumerate(self.cut_images):
+                for j, img in enumerate(row):
+                    temp_path = os.path.join(self.temp_dir.name, f"temp_image_{i}_{j}.png")
+                    img.save(temp_path, format="PNG")
+                    temp_image_paths.append(temp_path)
+            
+            self.upscale_worker = UpscaleWorker(temp_image_paths, save_path, selected_model)
+            self.progress_bar.setMaximum(len(temp_image_paths))
+            self.log_text_edit.append("Starting upscale process for cut images...")
+        else:
+            # Upscale the entire original image
+            temp_path = os.path.join(tempfile.gettempdir(), "temp_full_image.png")
+            self.original_image.save(temp_path, format="PNG")
+            
+            self.upscale_worker = UpscaleWorker([temp_path], save_path, selected_model)
+            self.progress_bar.setMaximum(1)
+            self.log_text_edit.append("Starting upscale process for full image...")
+
         self.upscale_worker.progress.connect(self.update_upscale_progress)
         self.upscale_worker.finished.connect(self.upscale_finished)
         self.upscale_worker.error.connect(self.upscale_error)
         self.upscale_worker.log.connect(self.log_upscale_message)
 
-        self.progress_bar.setMaximum(len(temp_image_paths))
         self.progress_bar.setValue(0)
         self.upscale_button.setEnabled(False)
         self.stop_upscale_button.setEnabled(True)
@@ -463,14 +496,19 @@ class ImageSplitter(QWidget):
         self.update_display_with_highlight()
         
         self.log_text_edit.clear()
-        self.log_text_edit.append("Starting upscale process...")
         
         self.upscale_worker.start()
 
     def stop_upscale(self):
-        if self.upscale_worker:
+        if self.upscale_worker and self.upscale_worker.isRunning():
             self.upscale_worker.stop()
+            self.upscale_worker.wait()  # Wait for the thread to finish
+            self.upscale_worker = None
             self.stop_upscale_button.setEnabled(False)
+            self.upscale_button.setEnabled(True)
+            self.log_text_edit.append("Upscale process stopped.")
+        else:
+            self.log_text_edit.append("No upscale process is currently running.")
 
     def update_upscale_progress(self, index, upscaled_img_path, status):
         self.progress_bar.setValue(index + 1)
@@ -491,16 +529,25 @@ class ImageSplitter(QWidget):
         if self.temp_dir:
             self.temp_dir.cleanup()
             self.temp_dir = None
+        if not self.is_cut:
+            upscaled_image_path = os.path.join(self.last_folder, "upscaled_image_1.jpg")
+            if os.path.exists(upscaled_image_path):
+                self.load_image(upscaled_image_path)
+                self.log_text_edit.append(f"Loaded upscaled image: {upscaled_image_path}")
+        self.upscale_worker = None  # Reset the worker
 
     def upscale_error(self, error_message):
         self.log_text_edit.append(f"Error: {error_message}")
         QMessageBox.critical(self, "Error", f"An error occurred during upscaling: {error_message}")
         self.upscale_button.setEnabled(True)
         self.stop_upscale_button.setEnabled(False)
-        self.upscale_worker.stop()
+        if self.upscale_worker:
+            self.upscale_worker.stop()
+            self.upscale_worker.wait()  # Wait for the thread to finish
         if self.temp_dir:
             self.temp_dir.cleanup()
             self.temp_dir = None
+        self.upscale_worker = None  # Reset the worker
 
     def log_upscale_message(self, message):
         logging.info(message)

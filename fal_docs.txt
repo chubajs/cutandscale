@@ -203,3 +203,22 @@ async def main():
 
 
 asyncio.run(main())
+
+
+defaults for creativity upscale:
+
+{
+  "model_type": "SD_1_5",
+  "image_url": "https://storage.googleapis.com/falserverless/model_tests/upscale/owl.png",
+  "scale": 2,
+  "creativity": 0.5,
+  "detail": 1,
+  "shape_preservation": 0.25,
+  "prompt_suffix": " high quality, highly detailed, high resolution, sharp",
+  "negative_prompt": "blurry, low resolution, bad, ugly, low quality, pixelated, interpolated, compression artifacts, noisey, grainy",
+  "seed": 42,
+  "guidance_scale": 7.5,
+  "num_inference_steps": 20,
+  "enable_safety_checks": true,
+  "additional_lora_scale": 1
+}
