@@ -1,15 +1,32 @@
 import sys
-from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QPushButton, QFileDialog, QLabel, QMessageBox, QHBoxLayout
+from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QPushButton, QFileDialog, QLabel, QMessageBox, QHBoxLayout, QProgressBar
 from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QImage
-from PyQt5.QtCore import Qt, QRect, QPoint
+from PyQt5.QtCore import Qt, QRect, QPoint, QThread, pyqtSignal
 from PIL import Image
 import io
 import os
+import asyncio
+import fal_client
+import base64
+import logging
+import requests
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class ImageLabel(QLabel):
     def __init__(self, parent):
         super().__init__(parent)
         self.parent = parent
+        self.line_grab_area = 10  # Pixels on each side of the line that can be grabbed
+        self.moving_line = None
+        self.line_colors = [
+            QColor(255, 0, 0),    # Pure red
+            QColor(220, 20, 60),  # Crimson
+            QColor(178, 34, 34),  # Firebrick
+            QColor(139, 0, 0),    # Dark red
+            QColor(255, 69, 0),   # Red-orange
+            QColor(255, 99, 71)   # Tomato
+        ]
 
     def paintEvent(self, event):
         super().paintEvent(event)
@@ -17,28 +34,161 @@ class ImageLabel(QLabel):
             painter = QPainter(self)
             painter.setRenderHint(QPainter.Antialiasing)
             
-            # Draw the lines over the image
-            pen = QPen(QColor(255, 0, 0, 128))  # Semi-transparent red
-            painter.setPen(pen)
-            
-            # Get the actual image dimensions and position within the label
             pixmap = self.pixmap()
             img_rect = pixmap.rect()
             img_rect.moveCenter(self.rect().center())
             
-            # Draw 3 horizontal lines with coordinates
-            for h in self.parent.h_lines:
+            # Draw lines
+            for i, h in enumerate(self.parent.h_lines):
+                pen = QPen(self.line_colors[i % len(self.line_colors)])
+                pen.setWidth(3)  # Increased width for boldness
+                painter.setPen(pen)
+                
                 y = int(img_rect.top() + h * img_rect.height())
                 painter.drawLine(img_rect.left(), y, img_rect.right(), y)
-                y_coord = int(h * self.parent.original_image.height)
-                painter.drawText(img_rect.left() + 5, y + 15, f"y: {y_coord}")
 
-            # Draw 3 vertical lines with coordinates
-            for v in self.parent.v_lines:
+            for i, v in enumerate(self.parent.v_lines):
+                pen = QPen(self.line_colors[(i + 3) % len(self.line_colors)])  # Offset by 3 to use different colors
+                pen.setWidth(3)  # Increased width for boldness
+                painter.setPen(pen)
+                
                 x = int(img_rect.left() + v * img_rect.width())
                 painter.drawLine(x, img_rect.top(), x, img_rect.bottom())
+
+            # Draw coordinates
+            for i, h in enumerate(self.parent.h_lines):
+                y = int(img_rect.top() + h * img_rect.height())
+                y_coord = int(h * self.parent.original_image.height)
+                self.draw_coordinate(painter, img_rect.left() + 5, y + 15, f"y: {y_coord}")
+
+            for i, v in enumerate(self.parent.v_lines):
+                x = int(img_rect.left() + v * img_rect.width())
                 x_coord = int(v * self.parent.original_image.width)
-                painter.drawText(x + 5, img_rect.top() + 15, f"x: {x_coord}")
+                self.draw_coordinate(painter, x + 5, img_rect.top() + 15, f"x: {x_coord}")
+
+    def draw_coordinate(self, painter, x, y, text):
+        # Set up the font
+        font = painter.font()
+        font.setBold(True)
+        font.setPointSize(10)
+        painter.setFont(font)
+
+        # Draw black shadow
+        painter.setPen(Qt.black)
+        for dx in [-1, 1]:
+            for dy in [-1, 1]:
+                painter.drawText(x + dx, y + dy, text)
+
+        # Draw white text
+        painter.setPen(Qt.white)
+        painter.drawText(x, y, text)
+
+    def mousePressEvent(self, event):
+        if not self.parent.is_cut and self.parent.display_image:
+            pixmap = self.pixmap()
+            img_rect = pixmap.rect()
+            img_rect.moveCenter(self.rect().center())
+            
+            if img_rect.contains(event.pos()):
+                x = (event.x() - img_rect.left()) / img_rect.width()
+                y = (event.y() - img_rect.top()) / img_rect.height()
+                
+                for i, h in enumerate(self.parent.h_lines):
+                    if abs(y - h) * img_rect.height() < self.line_grab_area:
+                        self.moving_line = ('h', i)
+                        return
+                for i, v in enumerate(self.parent.v_lines):
+                    if abs(x - v) * img_rect.width() < self.line_grab_area:
+                        self.moving_line = ('v', i)
+                        return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if not self.parent.is_cut and self.moving_line and self.parent.display_image:
+            pixmap = self.pixmap()
+            img_rect = pixmap.rect()
+            img_rect.moveCenter(self.rect().center())
+            
+            if img_rect.contains(event.pos()):
+                if self.moving_line[0] == 'h':
+                    new_y = (event.y() - img_rect.top()) / img_rect.height()
+                    self.parent.h_lines[self.moving_line[1]] = max(0, min(1, new_y))
+                else:
+                    new_x = (event.x() - img_rect.left()) / img_rect.width()
+                    self.parent.v_lines[self.moving_line[1]] = max(0, min(1, new_x))
+                self.update()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self.moving_line = None
+        super().mouseReleaseEvent(event)
+
+class UpscaleWorker(QThread):
+    progress = pyqtSignal(int, str)
+    finished = pyqtSignal()
+    error = pyqtSignal(str)
+    log = pyqtSignal(str)
+
+    def __init__(self, image_data, save_path):
+        super().__init__()
+        self.image_data = image_data
+        self.save_path = save_path
+        self.is_running = True
+
+    def run(self):
+        async def upscale_image(img_data, index):
+            if not self.is_running:
+                return
+            try:
+                self.log.emit(f"Starting upscale for image {index + 1}")
+
+                self.log.emit(f"Submitting request for image {index + 1}")
+                response = await fal_client.submit_async("fal-ai/aura-sr", arguments={
+                    "image": img_data,
+                    "upscaling_factor": 4,
+                    "checkpoint": "v2"
+                })
+
+                self.log.emit(f"Waiting for result for image {index + 1}")
+                result = await response.get()
+                self.log.emit(f"Received result for image {index + 1}")
+                self.log.emit(f"Full result: {result}")
+
+                upscaled_img_url = result["image"]["url"]
+                upscaled_img_path = f"{self.save_path}/upscaled_image_{index+1}.jpg"
+                self.log.emit(f"Downloading upscaled image {index + 1} from {upscaled_img_url}")
+                
+                response = requests.get(upscaled_img_url)
+                if response.status_code == 200:
+                    with open(upscaled_img_path, 'wb') as f:
+                        f.write(response.content)
+                    self.log.emit(f"Upscaled image {index + 1} saved to {upscaled_img_path}")
+                else:
+                    raise Exception(f"Failed to download image. Status code: {response.status_code}")
+
+                self.progress.emit(index, upscaled_img_path)
+                self.log.emit(f"Upscale completed for image {index + 1}")
+            except Exception as e:
+                self.log.emit(f"Error upscaling image {index + 1}: {str(e)}")
+                self.error.emit(str(e))
+                return False
+            return True
+
+        async def upscale_all():
+            for i, img_data in enumerate(self.image_data):
+                if not self.is_running:
+                    break
+                success = await upscale_image(img_data, i)
+                if not success:
+                    break
+
+        asyncio.run(upscale_all())
+        if self.is_running:
+            self.finished.emit()
+
+    def stop(self):
+        self.is_running = False
+        self.log.emit("Upscale process stopped")
 
 class ImageSplitter(QWidget):
     def __init__(self):
@@ -49,10 +199,11 @@ class ImageSplitter(QWidget):
         self.cut_images = None
         self.h_lines = [0.25, 0.5, 0.75]
         self.v_lines = [0.25, 0.5, 0.75]
-        self.moving_line = None
         self.line_thickness = 2
         self.last_folder = os.path.expanduser("~")
         self.is_cut = False
+        self.upscale_worker = None
+        self.current_upscale_index = -1
 
     def initUI(self):
         self.setWindowTitle('Image Splitter')
@@ -85,6 +236,19 @@ class ImageSplitter(QWidget):
         self.split_button.setEnabled(False)
         button_layout.addWidget(self.split_button)
 
+        self.upscale_button = QPushButton('Upscale')
+        self.upscale_button.clicked.connect(self.upscale_images)
+        self.upscale_button.setEnabled(False)
+        button_layout.addWidget(self.upscale_button)
+
+        self.stop_upscale_button = QPushButton('Stop Upscale')
+        self.stop_upscale_button.clicked.connect(self.stop_upscale)
+        self.stop_upscale_button.setEnabled(False)
+        button_layout.addWidget(self.stop_upscale_button)
+
+        self.progress_bar = QProgressBar(self)
+        layout.addWidget(self.progress_bar)
+
         layout.addLayout(button_layout)
 
         self.setLayout(layout)
@@ -111,9 +275,8 @@ class ImageSplitter(QWidget):
 
     def update_display(self):
         if self.is_cut and self.cut_images:
-            self.display_cut_images()
+            self.update_display_with_highlight()
         elif self.display_image:
-            # Resize the display image to fit the label
             label_size = self.image_label.size()
             scaled_image = self.display_image.copy()
             scaled_image.thumbnail((label_size.width(), label_size.height()), Image.LANCZOS)
@@ -122,50 +285,56 @@ class ImageSplitter(QWidget):
             self.image_label.setPixmap(pixmap)
             self.image_label.update()
 
-    def display_cut_images(self):
+    def update_display_with_highlight(self):
         if not self.cut_images:
             return
 
-        # Calculate the total width and height of the combined image
         total_width = sum(img.width for img in self.cut_images[0]) + 5 * (len(self.cut_images[0]) - 1)
         total_height = sum(row[0].height for row in self.cut_images) + 5 * (len(self.cut_images) - 1)
         
-        # Create a new image with the calculated dimensions
         combined = Image.new('RGB', (total_width, total_height), color='white')
         
-        # Paste the cut images onto the combined image
         y_offset = 0
+        image_positions = []
         for row in self.cut_images:
             x_offset = 0
             for img in row:
                 combined.paste(img, (x_offset, y_offset))
+                image_positions.append((x_offset, y_offset, img.width, img.height))
                 x_offset += img.width + 5
             y_offset += row[0].height + 5
 
-        # Calculate the aspect ratio of the combined image
-        aspect_ratio = total_width / total_height
-
-        # Get the size of the label
         label_width = self.image_label.width()
         label_height = self.image_label.height()
 
-        # Calculate the size to fit the combined image within the label
+        aspect_ratio = total_width / total_height
+
         if aspect_ratio > label_width / label_height:
-            # Width constrained
             new_width = label_width
             new_height = int(new_width / aspect_ratio)
         else:
-            # Height constrained
             new_height = label_height
             new_width = int(new_height * aspect_ratio)
 
-        # Resize the combined image to fit within the label
         combined_resized = combined.copy()
         combined_resized.thumbnail((new_width, new_height), Image.LANCZOS)
 
-        # Convert to QPixmap and display
+        scale_factor = new_width / total_width
+
         q_image = self.pil_to_qimage(combined_resized)
         pixmap = QPixmap.fromImage(q_image)
+
+        if self.current_upscale_index != -1 and self.current_upscale_index < len(image_positions):
+            painter = QPainter(pixmap)
+            painter.setPen(QPen(Qt.red, 5))
+            x, y, width, height = image_positions[self.current_upscale_index]
+            scaled_x = int(x * scale_factor)
+            scaled_y = int(y * scale_factor)
+            scaled_width = int(width * scale_factor)
+            scaled_height = int(height * scale_factor)
+            painter.drawRect(scaled_x, scaled_y, scaled_width, scaled_height)
+            painter.end()
+
         self.image_label.setPixmap(pixmap)
         self.image_label.update()
 
@@ -188,6 +357,7 @@ class ImageSplitter(QWidget):
         self.is_cut = True
         self.undo_button.setEnabled(True)
         self.cut_button.setEnabled(False)
+        self.upscale_button.setEnabled(True)
         self.update_display()
 
     def undo_cut(self):
@@ -195,39 +365,8 @@ class ImageSplitter(QWidget):
         self.cut_images = None
         self.undo_button.setEnabled(False)
         self.cut_button.setEnabled(True)
+        self.upscale_button.setEnabled(False)
         self.update_display()
-
-    def mousePressEvent(self, event):
-        if not self.is_cut and self.display_image:
-            image_rect = self.image_label.geometry()
-            if image_rect.contains(event.pos()):
-                x = (event.x() - image_rect.left()) / image_rect.width()
-                y = (event.y() - image_rect.top()) / image_rect.height()
-                
-                for i, h in enumerate(self.h_lines):
-                    if abs(y - h) < 0.02:
-                        self.moving_line = ('h', i)
-                        return
-                for i, v in enumerate(self.v_lines):
-                    if abs(x - v) < 0.02:
-                        self.moving_line = ('v', i)
-                        return
-
-    def mouseMoveEvent(self, event):
-        if not self.is_cut and self.moving_line and self.display_image:
-            image_rect = self.image_label.geometry()
-            if image_rect.contains(event.pos()):
-                if self.moving_line[0] == 'h':
-                    new_y = (event.y() - image_rect.top()) / image_rect.height()
-                    self.h_lines[self.moving_line[1]] = max(0, min(1, new_y))
-                else:
-                    new_x = (event.x() - image_rect.left()) / image_rect.width()
-                    self.v_lines[self.moving_line[1]] = max(0, min(1, new_x))
-                self.image_label.update()
-                # Removed the print_coordinates() call
-
-    def mouseReleaseEvent(self, event):
-        self.moving_line = None
 
     def split_image(self):
         if not self.original_image:
@@ -237,15 +376,12 @@ class ImageSplitter(QWidget):
         if self.is_cut:
             images_to_save = [img for row in self.cut_images for img in row]
         else:
-            # Get the current dimensions of the displayed image
             display_width = self.image_label.pixmap().width()
             display_height = self.image_label.pixmap().height()
 
-            # Calculate the scaling factors
             width_scale = self.original_image.width / display_width
             height_scale = self.original_image.height / display_height
 
-            # Calculate pixel positions based on the original image size
             h_pixels = [0] + [int(h * display_height * height_scale) for h in self.h_lines] + [self.original_image.height]
             v_pixels = [0] + [int(v * display_width * width_scale) for v in self.v_lines] + [self.original_image.width]
 
@@ -277,6 +413,67 @@ class ImageSplitter(QWidget):
                 QMessageBox.critical(self, "Error", error_message)
         else:
             print("Image splitting cancelled.")
+
+    def upscale_images(self):
+        if not self.is_cut or not self.cut_images:
+            return
+
+        save_path = QFileDialog.getExistingDirectory(self, "Select Directory to Save Upscaled Images", self.last_folder)
+        if not save_path:
+            return
+
+        self.last_folder = save_path
+        
+        image_data = []
+        for row in self.cut_images:
+            for img in row:
+                buffered = io.BytesIO()
+                img.save(buffered, format="JPEG")
+                img_str = base64.b64encode(buffered.getvalue()).decode()
+                image_data.append(f"data:image/jpeg;base64,{img_str}")
+        
+        self.upscale_worker = UpscaleWorker(image_data, save_path)
+        self.upscale_worker.progress.connect(self.update_upscale_progress)
+        self.upscale_worker.finished.connect(self.upscale_finished)
+        self.upscale_worker.error.connect(self.upscale_error)
+        self.upscale_worker.log.connect(self.log_upscale_message)
+
+        self.progress_bar.setMaximum(len(image_data))
+        self.progress_bar.setValue(0)
+        self.upscale_button.setEnabled(False)
+        self.stop_upscale_button.setEnabled(True)
+        
+        self.current_upscale_index = 0
+        self.update_display_with_highlight()
+        
+        self.upscale_worker.start()
+
+    def stop_upscale(self):
+        if self.upscale_worker:
+            self.upscale_worker.stop()
+            self.stop_upscale_button.setEnabled(False)
+
+    def update_upscale_progress(self, index, upscaled_img_path):
+        self.progress_bar.setValue(index + 1)
+        self.current_upscale_index = index + 1
+        if self.current_upscale_index < len(self.cut_images):
+            self.update_display_with_highlight()
+
+    def upscale_finished(self):
+        self.upscale_button.setEnabled(True)
+        self.stop_upscale_button.setEnabled(False)
+        self.current_upscale_index = -1
+        self.update_display()
+        QMessageBox.information(self, "Success", "Upscaling completed successfully!")
+
+    def upscale_error(self, error_message):
+        QMessageBox.critical(self, "Error", f"An error occurred during upscaling: {error_message}")
+        self.upscale_button.setEnabled(True)
+        self.stop_upscale_button.setEnabled(False)
+        self.upscale_worker.stop()
+
+    def log_upscale_message(self, message):
+        logging.info(message)
 
     def pil_to_qimage(self, pil_image):
         buffer = io.BytesIO()
